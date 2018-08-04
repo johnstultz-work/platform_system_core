@@ -34,180 +34,77 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <log/log.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <utils/Compat.h>
 
-#define ASHMEM_DEVICE "/dev/ashmem"
-
-/* ashmem identity */
-static dev_t __ashmem_rdev;
-/*
- * If we trigger a signal handler in the middle of locked activity and the
- * signal handler calls ashmem, we could get into a deadlock state.
- */
-static pthread_mutex_t __ashmem_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* logistics of getting file descriptor for ashmem */
-static int __ashmem_open_locked()
+#ifndef HAVE_MEMFD_CREATE
+#if ((ULONG_MAX) == (UINT_MAX))
+#define __NR_memfd_create  (385)
+#else
+#define __NR_memfd_create 279
+#endif
+#define SYS_memfd_create __NR_memfd_create
+static inline int
+memfd_create(const char *name, unsigned int flags)
 {
-    int ret;
-    struct stat st;
+   return syscall(SYS_memfd_create, name, flags);
+}
+#endif
 
-    int fd = TEMP_FAILURE_RETRY(open(ASHMEM_DEVICE, O_RDWR | O_CLOEXEC));
+int ashmem_create_region(const char* name, size_t size) {
+
+    int fd = memfd_create(name, 0);
     if (fd < 0) {
-        return fd;
+      ALOGE("JDB: memfd_create failed! %i\n", fd);
+      return fd;
     }
-
-    ret = TEMP_FAILURE_RETRY(fstat(fd, &st));
-    if (ret < 0) {
-        int save_errno = errno;
-        close(fd);
-        errno = save_errno;
-        return ret;
-    }
-    if (!S_ISCHR(st.st_mode) || !st.st_rdev) {
-        close(fd);
-        errno = ENOTTY;
-        return -1;
-    }
-
-    __ashmem_rdev = st.st_rdev;
-    return fd;
-}
-
-static int __ashmem_open()
-{
-    int fd;
-
-    pthread_mutex_lock(&__ashmem_lock);
-    fd = __ashmem_open_locked();
-    pthread_mutex_unlock(&__ashmem_lock);
-
-    return fd;
-}
-
-/* Make sure file descriptor references ashmem, negative number means false */
-static int __ashmem_is_ashmem(int fd, int fatal)
-{
-    dev_t rdev;
-    struct stat st;
-
-    if (fstat(fd, &st) < 0) {
-        return -1;
-    }
-
-    rdev = 0; /* Too much complexity to sniff __ashmem_rdev */
-    if (S_ISCHR(st.st_mode) && st.st_rdev) {
-        pthread_mutex_lock(&__ashmem_lock);
-        rdev = __ashmem_rdev;
-        if (rdev) {
-            pthread_mutex_unlock(&__ashmem_lock);
-        } else {
-            int fd = __ashmem_open_locked();
-            if (fd < 0) {
-                pthread_mutex_unlock(&__ashmem_lock);
-                return -1;
-            }
-            rdev = __ashmem_rdev;
-            pthread_mutex_unlock(&__ashmem_lock);
-
-            close(fd);
-        }
-
-        if (st.st_rdev == rdev) {
-            return 0;
-        }
-    }
-
-    if (fatal) {
-        if (rdev) {
-            LOG_ALWAYS_FATAL("illegal fd=%d mode=0%o rdev=%d:%d expected 0%o %d:%d",
-              fd, st.st_mode, major(st.st_rdev), minor(st.st_rdev),
-              S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IRGRP,
-              major(rdev), minor(rdev));
-        } else {
-            LOG_ALWAYS_FATAL("illegal fd=%d mode=0%o rdev=%d:%d expected 0%o",
-              fd, st.st_mode, major(st.st_rdev), minor(st.st_rdev),
-              S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IRGRP);
-        }
-        /* NOTREACHED */
-    }
-
-    errno = ENOTTY;
-    return -1;
-}
-
-static int __ashmem_check_failure(int fd, int result)
-{
-    if (result == -1 && errno == ENOTTY) __ashmem_is_ashmem(fd, 1);
-    return result;
-}
-
-int ashmem_valid(int fd)
-{
-    return __ashmem_is_ashmem(fd, 0) >= 0;
-}
-
-/*
- * ashmem_create_region - creates a new ashmem region and returns the file
- * descriptor, or <0 on error
- *
- * `name' is an optional label to give the region (visible in /proc/pid/maps)
- * `size' is the size of the region, in page-aligned bytes
- */
-int ashmem_create_region(const char *name, size_t size)
-{
-    int ret, save_errno;
-
-    int fd = __ashmem_open();
-    if (fd < 0) {
-        return fd;
-    }
-
-    if (name) {
-        char buf[ASHMEM_NAME_LEN] = {0};
-
-        strlcpy(buf, name, sizeof(buf));
-        ret = TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_NAME, buf));
-        if (ret < 0) {
-            goto error;
-        }
-    }
-
-    ret = TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_SIZE, size));
-    if (ret < 0) {
-        goto error;
+    if (TEMP_FAILURE_RETRY(ftruncate(fd, size)) == -1) {
+      ALOGE("JDB: ftruncate failed!\n");
+      close(fd);
+      return -1;
     }
 
     return fd;
-
-error:
-    save_errno = errno;
-    close(fd);
-    errno = save_errno;
-    return ret;
 }
 
-int ashmem_set_prot_region(int fd, int prot)
-{
-    return __ashmem_check_failure(fd, TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_PROT_MASK, prot)));
+int ashmem_set_prot_region(int /*fd*/, int /*prot*/) {
+    return 0;
 }
 
-int ashmem_pin_region(int fd, size_t offset, size_t len)
-{
-    // TODO: should LP64 reject too-large offset/len?
-    ashmem_pin pin = { static_cast<uint32_t>(offset), static_cast<uint32_t>(len) };
-
-    return __ashmem_check_failure(fd, TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_PIN, &pin)));
+int ashmem_pin_region(int /*fd*/, size_t /*offset*/, size_t /*len*/) {
+    return 0 /*ASHMEM_NOT_PURGED*/;
 }
 
-int ashmem_unpin_region(int fd, size_t offset, size_t len)
-{
-    // TODO: should LP64 reject too-large offset/len?
-    ashmem_pin pin = { static_cast<uint32_t>(offset), static_cast<uint32_t>(len) };
-
-    return __ashmem_check_failure(fd, TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_UNPIN, &pin)));
+int ashmem_unpin_region(int /*fd*/, size_t /*offset*/, size_t /*len*/) {
+    return 0 /*ASHMEM_IS_UNPINNED*/;
 }
 
 int ashmem_get_size_region(int fd)
 {
-    return __ashmem_check_failure(fd, TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_GET_SIZE, NULL)));
+    struct stat buf;
+    int result = fstat(fd, &buf);
+    if (result == -1) {
+        return -1;
+    }
+
+    /*
+     * Check if this is an "ashmem" region.
+     * TODO: This is very hacky, and can easily break.
+     * We need some reliable indicator.
+     */
+    if (!(buf.st_nlink == 0 && S_ISREG(buf.st_mode))) {
+        errno = ENOTTY;
+        return -1;
+    }
+
+    return buf.st_size;
 }
+
+int ashmem_valid(int /*fd*/)
+{
+    return  1;
+}
+
